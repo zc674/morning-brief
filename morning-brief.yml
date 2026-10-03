@@ -1,0 +1,61 @@
+name: Morning brief
+
+on:
+  schedule:
+    # GitHub cron is in UTC. 10:15 UTC = 6:15am New York / 5:15am Chicago
+    # (one hour earlier in winter). GitHub can start scheduled runs 10–30 min
+    # late, so keep this well before your alarm.
+    - cron: "15 10 * * *"
+  workflow_dispatch: {}   # adds a "Run workflow" button for testing
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Write and voice today's briefing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NEWSLETTER_EMAIL: ${{ secrets.NEWSLETTER_EMAIL }}
+          NEWSLETTER_PASSWORD: ${{ secrets.NEWSLETTER_PASSWORD }}
+          NEWSLETTER_SENDERS: ${{ vars.NEWSLETTER_SENDERS }}
+          BRIEF_TOPICS: ${{ vars.BRIEF_TOPICS }}
+          BRIEF_CITY: ${{ vars.BRIEF_CITY }}
+          BRIEF_NAME: ${{ vars.BRIEF_NAME }}
+          BRIEF_SOURCES: ${{ vars.BRIEF_SOURCES }}
+          BRIEF_TIMEZONE: ${{ vars.BRIEF_TIMEZONE || 'America/New_York' }}
+          BRIEF_MINUTES: ${{ vars.BRIEF_MINUTES || '3' }}
+          TTS_VOICE: ${{ vars.TTS_VOICE || 'marin' }}
+        run: |
+          # Treat empty repo variables as "use the script's default"
+          for v in BRIEF_TOPICS BRIEF_CITY BRIEF_NAME BRIEF_SOURCES NEWSLETTER_SENDERS; do
+            [ -z "${!v}" ] && unset $v
+          done
+          python brief.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
