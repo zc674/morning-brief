@@ -10,6 +10,21 @@ GitHub Actions (6:15am) → brief.py → Claude + web search → script
 iPhone: alarm stopped → Shortcut downloads briefing.mp3 → plays it
 ```
 
+## How the agent works
+
+Each run, Claude works in a loop and decides for itself what to do next:
+
+1. **Research:** it searches the web, opens full articles when a snippet isn't
+   enough, and calls `get_market_quotes` (live Yahoo Finance data, see `market.py`)
+   for every market number it plans to say.
+2. **Fact-check:** it reviews its own draft against what it retrieved, re-checks
+   anything doubtful, and fixes or cuts it. The Actions log lists every search,
+   article and quote it used, plus what the fact-check changed.
+3. The final script is voiced and published, with a **Sources** list on the page.
+
+Optional variables: `MAX_SEARCHES` (default 10), `MAX_FETCHES` (default 6),
+`FACT_CHECK` (`0` to skip the review pass and save a little time and money).
+
 ## 1. Get two API keys (~5 min)
 
 | Key | Where | Rough cost |

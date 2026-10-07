@@ -2,9 +2,12 @@
 """
 Morning news briefing agent.
 
-1. Asks Claude (with web search) to research today's news and write a
-   short briefing meant to be heard, not read.
-2. Turns it into an MP3 with OpenAI text-to-speech (optional).
+1. Research: Claude works in a tool-use loop. It decides what to search for,
+   opens full articles when a snippet isn't enough (web fetch), and pulls live
+   market numbers (get_market_quotes) for anything it plans to say.
+2. Fact-check: Claude reviews its own draft against what it retrieved,
+   re-verifies anything doubtful with the same tools, and fixes or cuts it.
+3. Turns the final script into an MP3 with OpenAI text-to-speech (optional).
 3. Writes everything to ./public so it can be served from GitHub Pages:
      public/briefing.mp3   <- your phone plays this when your alarm stops
      public/briefing.txt   <- fallback: iPhone "Speak Text" can read this
@@ -22,12 +25,16 @@ Settings come from environment variables (all optional except the API key):
                       (e.g. "reuters.com,cnbc.com,apnews.com"); empty = open web
   NEWSLETTER_*        optional: read subscription newsletters from your inbox
                       (see newsletters.py)
+  MAX_SEARCHES        web searches allowed per run (default 10)
+  MAX_FETCHES         full articles Claude may open per run (default 6)
+  FACT_CHECK          set to 0 to skip the self-review pass
   CLAUDE_MODEL        Claude model to use
   TTS_VOICE           OpenAI voice (marin, cedar, coral, ...)
 """
 
 import datetime
 import html
+import json
 import os
 import pathlib
 import re
@@ -45,7 +52,10 @@ MINUTES = int(os.environ.get("BRIEF_MINUTES", "3"))
 NAME = os.environ.get("BRIEF_NAME", "").strip()
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 VOICE = os.environ.get("TTS_VOICE", "marin")
-MAX_SEARCHES = int(os.environ.get("MAX_SEARCHES", "8"))
+MAX_SEARCHES = int(os.environ.get("MAX_SEARCHES", "10"))
+MAX_FETCHES = int(os.environ.get("MAX_FETCHES", "6"))
+FACT_CHECK = os.environ.get("FACT_CHECK", "1") != "0"
+MAX_STEPS = 12  # model calls per phase; stops a runaway loop
 SOURCES = [d.strip() for d in os.environ.get("BRIEF_SOURCES", "").split(",") if d.strip()]
 
 TTS_CHUNK_CHARS = 3500  # the speech endpoint caps input length per request
@@ -83,8 +93,17 @@ def build_prompt(now: datetime.datetime, newsletters: str = "") -> tuple[str, st
         else ""
     )
     user = (
-        f"Today is {now:%A, %B %-d, %Y}. Search the web for today's news and write "
-        f"a wake-up briefing of about {words} words covering: {TOPICS}.\n\n"
+        f"It is {now:%A, %B %-d, %Y}, {now:%-I:%M %p} {now:%Z}. Prepare a wake-up "
+        f"briefing of about {words} words covering: {TOPICS}.\n\n"
+        "Work like a careful news producer. You decide how to research:\n"
+        "- Search for today's news on each topic.\n"
+        "- When a story matters and the search snippet is thin or unclear, open the "
+        "full article with web_fetch before writing about it.\n"
+        "- Call get_market_quotes for every market number you plan to say (index "
+        "levels and moves, futures, Treasury yields, currencies, stock prices), and "
+        "use its latest_date to say when the number is from.\n"
+        "- Stop researching when you can write an accurate briefing; you don't have "
+        "to use every tool.\n\n"
         f"{greeting}{weather}"
         "Lead with the single most important story. Give each story two or three "
         "sentences of context explaining why it matters. Use natural spoken "
@@ -100,38 +119,112 @@ def build_prompt(now: datetime.datetime, newsletters: str = "") -> tuple[str, st
     return system, user
 
 
-def write_briefing(now: datetime.datetime, newsletters: str = "") -> str:
+REVIEW_PROMPT = (
+    "Before this is read aloud, fact-check your draft carefully.\n"
+    "- Check every number, name, date and claim against what you actually "
+    "retrieved this session. If you are not sure about something, verify it with "
+    "your tools now, or cut it.\n"
+    "- Every market number must match a get_market_quotes result (or a source you "
+    "read today) and must say when it is from.\n"
+    "- Drop anything older than about 36 hours that is presented as new.\n"
+    "- Keep it within the requested length and spoken style.\n\n"
+    "Then reply with the corrected final script between <briefing> and </briefing> "
+    "tags, followed by a short list of what you changed between <changes> and "
+    "</changes> tags (write 'none' if nothing needed fixing)."
+)
+
+
+def _run_client_tool(block) -> dict:
+    """Execute a tool that runs here (not on Anthropic's servers)."""
+    if block.name == "get_market_quotes":
+        import market
+
+        symbols = (block.input or {}).get("symbols", [])
+        print(f"  quotes: {', '.join(symbols)}")
+        try:
+            return {"content": json.dumps(market.get_market_quotes(symbols))}
+        except Exception as exc:
+            return {"content": f"Market data unavailable ({type(exc).__name__}). "
+                               "Use web search for numbers instead.", "is_error": True}
+    return {"content": f"Unknown tool {block.name}", "is_error": True}
+
+
+def _log_server_tool(block) -> None:
+    if block.type == "server_tool_use":
+        inp = block.input or {}
+        what = inp.get("query") or inp.get("url") or json.dumps(inp)[:120]
+        print(f"  {block.name}: {what}")
+
+
+def _agent_turn(client, system, tools, messages, sources) -> str:
+    """Let Claude work until it stops calling tools. Returns its final text."""
+    for step in range(MAX_STEPS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=6000, system=system, tools=tools, messages=messages
+        )
+        if messages[-1]["role"] == "assistant":
+            # Continuing a paused turn: it's still the same assistant message.
+            messages[-1]["content"] = list(messages[-1]["content"]) + list(resp.content)
+        else:
+            messages.append({"role": "assistant", "content": list(resp.content)})
+        for b in resp.content:
+            _log_server_tool(b)
+            for c in getattr(b, "citations", None) or []:
+                url = getattr(c, "url", None)
+                if url:
+                    sources.setdefault(url, getattr(c, "title", None) or url)
+
+        if resp.stop_reason == "pause_turn":
+            # Long server-side tool work; send the turn back so Claude continues.
+            continue
+        if resp.stop_reason == "tool_use":
+            results = []
+            for b in resp.content:
+                if b.type == "tool_use":
+                    r = _run_client_tool(b)
+                    results.append({"type": "tool_result", "tool_use_id": b.id, **r})
+            if results:
+                messages.append({"role": "user", "content": results})
+                continue
+        # end_turn / max_tokens: Claude is done with this phase.
+        return "".join(b.text for b in resp.content if b.type == "text")
+    print(f"  stopped after {MAX_STEPS} steps")
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+
+def write_briefing(now: datetime.datetime, newsletters: str = "") -> tuple[str, dict]:
     import anthropic
+    import market
 
     client = anthropic.Anthropic()
     system, user = build_prompt(now, newsletters)
 
-    tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_SEARCHES}
+    search = {"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_SEARCHES}
     if TZ:
-        tool["user_location"] = {"type": "approximate", "timezone": TZ}
+        search["user_location"] = {"type": "approximate", "timezone": TZ}
     if SOURCES:
-        tool["allowed_domains"] = SOURCES
+        search["allowed_domains"] = SOURCES
+    fetch = {"type": "web_fetch_20250910", "name": "web_fetch",
+             "max_uses": MAX_FETCHES, "max_content_tokens": 8000}
+    tools = [search, fetch, market.QUOTE_TOOL]
 
     messages = [{"role": "user", "content": user}]
-    assistant_content = []
-    collected_text = []
+    sources: dict[str, str] = {}
 
-    # Server-side search can pause a long turn ("pause_turn"); resend to continue.
-    for _ in range(6):
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=system,
-            tools=[tool],
-            messages=messages,
-        )
-        assistant_content.extend(resp.content)
-        collected_text.extend(b.text for b in resp.content if b.type == "text")
-        if resp.stop_reason != "pause_turn":
-            break
-        messages = [messages[0], {"role": "assistant", "content": assistant_content}]
+    print("Researching and drafting...")
+    draft = extract_script(_agent_turn(client, system, tools, messages, sources))
+    if not FACT_CHECK or len(draft) < 200:
+        return draft, sources
 
-    return extract_script("".join(collected_text))
+    print("Fact-checking draft...")
+    messages.append({"role": "user", "content": REVIEW_PROMPT})
+    reviewed_raw = _agent_turn(client, system, tools, messages, sources)
+    changes = re.search(r"<changes>(.*?)</changes>", reviewed_raw, re.S)
+    if changes:
+        print("Fact-check changes:\n  " + changes.group(1).strip().replace("\n", "\n  "))
+    final = extract_script(reviewed_raw.split("<changes>")[0])
+    # Keep the draft if the review didn't return a usable script.
+    return (final if len(final) >= 200 else draft), sources
 
 
 def extract_script(raw: str) -> str:
@@ -186,9 +279,14 @@ def make_audio(script: str, path: pathlib.Path) -> None:
             f.write(resp.read())  # MP3 frames concatenate cleanly
 
 
-def write_page(script: str, now: datetime.datetime, has_audio: bool) -> None:
+def write_page(script: str, now: datetime.datetime, has_audio: bool, sources: dict | None = None) -> None:
     paragraphs = "".join(f"<p>{html.escape(p)}</p>" for p in script.split("\n\n") if p.strip())
     audio = '<audio controls src="briefing.mp3" style="width:100%"></audio>' if has_audio else ""
+    links = "".join(
+        f'<li><a href="{html.escape(u, quote=True)}">{html.escape(t)}</a></li>'
+        for u, t in list((sources or {}).items())[:30]
+    )
+    source_list = f'<h2>Sources</h2><ol class="src">{links}</ol>' if links else ""
     (OUT_DIR / "index.html").write_text(
         f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -199,10 +297,13 @@ def write_page(script: str, now: datetime.datetime, has_audio: bool) -> None:
 body{{margin:0;background:var(--bg);color:var(--fg);font:18px/1.6 Georgia,serif}}
 main{{max-width:640px;margin:0 auto;padding:32px 16px}}
 h1{{font-size:28px;margin:0}} .date{{color:var(--muted);margin:4px 0 24px}}
+h2{{font-size:18px;margin:32px 0 8px}} .src{{font-size:14px;line-height:1.5;padding-left:20px}}
+a{{color:inherit}} .src a{{word-break:break-word}}
 </style></head><body><main>
 <h1>Morning Brief</h1><p class="date">{now:%A, %B %-d, %Y}</p>
 {audio}{paragraphs}
-<p class="date">Written and voiced by AI from today's news searches.</p>
+{source_list}
+<p class="date">Written and voiced by AI from today's news searches and market data.</p>
 </main></body></html>""",
         encoding="utf-8",
     )
@@ -229,7 +330,7 @@ def main() -> int:
         except Exception as exc:  # never let the inbox break the morning
             print(f"Newsletters skipped ({type(exc).__name__}: {exc}); using web search only.")
 
-    script = write_briefing(now, newsletters)
+    script, sources = write_briefing(now, newsletters)
     if len(script) < 200:
         print("Briefing came back too short; not publishing.\n" + script, file=sys.stderr)
         return 1
@@ -244,7 +345,8 @@ def main() -> int:
     else:
         print("OPENAI_API_KEY not set; skipping audio (text only).")
 
-    write_page(script, now, has_audio)
+    write_page(script, now, has_audio, sources)
+    print(f"Sources cited: {len(sources)}")
     return 0
 
 
